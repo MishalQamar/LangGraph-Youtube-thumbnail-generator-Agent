@@ -1,5 +1,5 @@
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Send, Interrupt
 from typing import TypedDict
 import subprocess
 from openai import OpenAI
@@ -8,6 +8,9 @@ from typing_extensions import Annotated
 from langchain.chat_models import init_chat_model
 import operator
 import base64
+from langgraph.checkpoint.memory import InMemorySaver
+
+memory = InMemorySaver()
 
 llm = init_chat_model(model="gpt-4o-mini")
 
@@ -20,6 +23,8 @@ class State(TypedDict):
     thumbnail_prompts: Annotated[list[str], operator.add]
     thumbnail_sketches: Annotated[list[str], operator.add]
     final_summary: str
+    user_feedback: str
+    chosen_prompt: str
 
 
 def extract_audio(state: State) -> State:
@@ -139,6 +144,50 @@ def generate_thumbnail(args):
     }
 
 
+def human_feedback(state: State):
+    answer = Interrupt(
+        prompt={
+            "chosen_prompt": "Which thumbnail  do you like best?",
+            "feedback": "Please provide feedback on the thumbnail or changes you would like.",
+        }
+    )
+    user_feedback = answer["user_feedback"]
+    chosen_prompt = answer["chosen_prompt"]
+    return {
+        "user_feedback": user_feedback,
+        "chosen_prompt": state["thumbnail_prompts"][chosen_prompt - 1],
+    }
+
+
+def generate_hd_thumbnail(state: State):
+    prompt = state["chosen_prompt"]
+    user_feedback = state["user_feedback"]
+
+    prompt = f"""
+    You are a helpful assistant that generates thumbnails for videos.
+    You will be given a prompt for a thumbnail and user feedback.
+    The prompt is:
+    {prompt}
+    The user feedback is:
+    {user_feedback}
+    Generate a high-quality thumbnail prompt based on the prompt and user feedback.
+    Always padding between the main visual elements and the text.
+    """
+    response = llm.invoke(prompt)
+    hd_prompt = response.content
+    client = OpenAI()
+    result = client.images.generate(
+        model="gpt-image-1",
+        prompt=hd_prompt,
+        quality="high",
+        moderation="high",
+        size="auto",
+    )
+    images_bytes = base64.b64encode(result.data[0].b64_json)
+    with open("hd_thumbnail.jpg", "wb") as file:
+        file.write(images_bytes)
+
+
 graph_builder = StateGraph(State)
 graph_builder.add_node("extract_audio", extract_audio)
 graph_builder.add_node("transcribe_audio", transcribe_audio)
@@ -146,6 +195,8 @@ graph_builder.add_node("summarise_chunk", summarise_chunk)
 graph_builder.add_node("mega_summarise", mega_summarise)
 
 graph_builder.add_node("generate_thumbnail", generate_thumbnail)
+graph_builder.add_node("human_feedback", human_feedback)
+graph_builder.add_node("generate_hd_thumbnail", generate_hd_thumbnail)
 
 graph_builder.add_edge(START, "extract_audio")
 graph_builder.add_edge("extract_audio", "transcribe_audio")
@@ -156,5 +207,9 @@ graph_builder.add_edge("summarise_chunk", mega_summarise)
 graph_builder.add_conditional_edges(
     "mega_summarise", dispatch_artists, ["generate_thumbnail"]
 )
-graph_builder.add_edge("generate_thumbnail", END)
-graph = graph_builder.compile()
+graph_builder.add_edge("generate_thumbnail", human_feedback)
+graph_builder.add_edge("human_feedback", "generate_hd_thumbnail")
+graph_builder.add_edge("generate_hd_thumbnail", END)
+graph = graph_builder.compile(checkpointer=memory)
+
+config = {"configurable": {"thread_id": "1"}}
